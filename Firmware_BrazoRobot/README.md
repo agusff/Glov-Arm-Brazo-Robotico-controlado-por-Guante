@@ -1,40 +1,54 @@
----------------Nodo Actuador - Controlador del Brazo Robótico (Proyecto Glov-Arm)------------------------
-Descripción General
+# 🤖 Nodo Actuador - Controlador del Brazo Robotico
+### 🌌 Proyecto Glov-Arm
 
-- Este directorio contiene el código fuente y la documentación técnica correspondiente al Nodo Actuador del sistema de teleoperación.
+Este directorio contiene el código fuente y la documentación técnica correspondiente al **Nodo Actuador** del sistema de teleoperación. Funciona como el cerebro del brazo robótico, encargado de recibir los comandos de movimiento empaquetados y traducirlos en acciones físicas. Su diseño se centra en un procesamiento determinista y concurrente para replicar con fidelidad el movimiento humano capturado por el guantelete.
 
-- Este subsistema funciona como el cerebro del brazo robótico, encargado de recibir los comandos de movimiento empaquetados y traducirlos en acciones físicas.
+---
 
-- El diseño se centra en un procesamiento determinista y concurrente para replicar con fidelidad el movimiento humano capturado por el guantelete.
+## 🛠️ Arquitectura de Hardware
 
-Arquitectura de Hardware
+El hardware seleccionado garantiza un control robusto, preciso y una retroalimentación en tiempo real para el operador:
 
-- El hardware ha sido seleccionado para garantizar un control robusto y preciso:
+| Componente | Especificación / Función |
+| :--- | :--- |
+| **Microcontrolador** | STM32F411 (Black Pill) como núcleo principal del sistema. |
+| **Actuadores** | 4 Servomotores SG90 para el control de pinza, muñeca, codo y hombro. |
+| **Interfaz de Usuario** | Pantalla LCD 16x2 con módulo de expansión I2C (PCF8574T). |
+| **Control Físico** | Botón dedicado para ejecutar la rutina de puesta a cero y autotesteo. |
 
-- Microcontrolador Principal: El núcleo del sistema es una placa de desarrollo STM32F411 (Black Pill).
+### 📺 Estados Visuales (Pantalla LCD)
+La pantalla provee retroalimentación visual crítica al operador mostrando los siguientes estados del sistema:
+* 🟢 **Conectado:** Enlace activo con el Gateway.
+* 🔴 **Desconectado:** Pérdida de comunicación o fuera de línea.
+* ⚙️ **Prueba:** Ejecución activa de la rutina *Home*.
 
-- Actuadores: El accionamiento mecánico está compuesto por 4 servomotores SG90 que controlan la pinza, muñeca, codo y hombro del brazo.
+> 📐 **Nota sobre el Diseño Mecánico:** El diseño 3D del brazo robótico no es de dominio propio. Si desea conseguir los archivos o ver su ensamblaje, puede obtener más información en este [Video de YouTube](https://www.youtube.com/watch?v=cWuJPlkmxCE).
 
-- Interfaz de Usuario (UI): Se integra una pantalla LCD 16x2 con un módulo de expansión I2C (basado en el chip PCF8574T).
+---
 
-- Estados Visuales: Esta pantalla provee retroalimentación visual al operador mostrando estados críticos: "Conectado", "Desconectado" o "Prueba" (durante la ejecución de la rutina Home).
+## 💻 Entorno de Desarrollo y Herramientas
 
-- Control de Inicialización: Incluye un botón físico dedicado para ejecutar la rutina de puesta a cero y autotesteo de la mecánica.
+* **Lenguaje de Programación:** C nativo enfocado a sistemas embebidos de alto rendimiento.
+* **IDE Principal:** [STM32CubeIDE](https://st.com) para la programación y depuración profesional del firmware.
+* **Configurador gráfico:** [STM32CubeMX](https://st.com) para la inicialización de periféricos, árbol de relojes (clocks) y mapeo de pines.
 
-- El diseño 3D del brazo robot no es de dominio propio, si desea conseguirlo puede obtener informacion en: https://www.youtube.com/watch?v=cWuJPlkmxCE
+---
 
-Entorno de Desarrollo y Herramientas
+## ⚙️ Características Técnicas del Firmware
 
-- Todo el firmware ha sido programado en lenguaje C utilizando el entorno de desarrollo profesional STM32CubeIDE.
+La arquitectura de software está completamente orientada a la eficiencia y a evitar bloqueos de la CPU utilizando técnicas avanzadas de hardware:
 
-- La configuración inicial de los periféricos, el reloj del sistema y el mapeo de pines se realizó mediante la herramienta STM32CubeMX.
+* **Control PWM por Hardware**
+  * Accionamiento de los SG90 mediante señales PWM generadas directamente por los Timers internos.
+  * Garantiza una frecuencia de 50 Hz altamente precisa y libre de fluctuaciones.
+  * Elimina por completo el temblor (*jitter*) en los acoples mecánicos.
 
-Características Técnicas del Firmware
+* **Recepción Asíncrona vía DMA**
+  * Gestión de paquetes provenientes del Gateway (vía UART) usando Acceso Directo a Memoria.
+  * Permite al microcontrolador leer y validar el *Checksum* de las tramas entrantes en segundo plano.
+  * Evita la interrupción del bucle principal y mantiene estables los pulsos de control de los motores.
 
-- La arquitectura de software está orientada a la eficiencia y a evitar bloqueos de la CPU:
-
-- Control PWM por Hardware: El accionamiento de los servomotores SG90 se realiza mediante señales PWM generadas directamente por los temporizadores (Timers) de hardware. Esto garantiza una señal de 50 Hz altamente precisa y elimina el temblor ("jitter") en el movimiento.
-
-- Recepción Asíncrona vía DMA: La recepción de los paquetes de datos provenientes del Gateway (vía UART) se gestiona utilizando Acceso Directo a Memoria (DMA). Esto asegura que el microcontrolador pueda leer y validar el Checksum de las tramas entrantes sin interrumpir el procesamiento principal ni los pulsos de control de los motores.
-
-- Interfaz Orientada a Eventos: La actualización de los mensajes en la pantalla LCD a través del bus I2C está diseñada para reaccionar únicamente ante los cambios de estado, evitando funciones bloqueantes dentro del bucle principal que pudieran ralentizar el control del brazo.
+* **Interfaz Orientada a Eventos**
+  * Actualización de la pantalla LCD a través del bus I2C reactiva a cambios de estado.
+  * Excluye funciones bloqueantes del bucle principal (*main loop*).
+  * Asegura que el flujo de control del brazo nunca pierda prioridad ni sufra retardos.

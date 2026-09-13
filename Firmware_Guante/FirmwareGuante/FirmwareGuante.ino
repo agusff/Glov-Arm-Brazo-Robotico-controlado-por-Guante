@@ -53,19 +53,26 @@
 MPU6050 sensor;
 
 // --- DIRECCIÓN MAC DEL RECEPTOR (ESP_brazo) ---
-uint8_t broadcastAddress[] = {0x1C, 0xDB, 0xD4, 0xC6, 0x76, 0x38};
+uint8_t broadcastAddress[] = { 0x1C, 0xDB, 0xD4, 0xC6, 0x76, 0x38 };
 
-// Canal WiFi fijo para ESP-NOW: WiFi.channel() antes de esta llamada
-// solo devuelve un valor de configuración, no garantiza que el radio
-// ESP-NOW esté realmente sincronizado ahí en las dos puntas — hay que
-// fijarlo explícito a nivel driver en ambos nodos (mismo valor acá y
-// en main_receiver.cpp) para que los paquetes lleguen de forma confiable.
+// Canal WiFi fijo para ESP-NOW
 #define ESPNOW_WIFI_CHANNEL 1
 
+
+// --- Estado de bajo consumo ---
+enum EstadoGuante { GUANTE_IDLE,
+                    GUANTE_ACTIVO };
+volatile EstadoGuante estadoGuante = GUANTE_IDLE;
+
+// --- ESTRUCTURA DE DATOS PARA ESP-NOW (definida en data_packet.h) ---
+GloveDataPacket_t datosGuante;
+esp_now_peer_info_t peerInfo;
+
+
 // --- Configuración Sensores Hall ---
-const int pinHallIndice  = 0;   // ADC1_CH0
-const int pinHallCorazon = 1;   // ADC1_CH1
-const int UMBRAL_HALL    = 3000;
+const int pinHallIndice = 0;   // ADC1_CH0
+const int pinHallCorazon = 1;  // ADC1_CH1
+const int UMBRAL_HALL = 3000;
 
 int16_t ax, ay, az, gx, gy, gz;
 unsigned long tiempo_prev;
@@ -73,16 +80,14 @@ float dt;
 float angulo_x = 0, angulo_y = 0;
 float error_gx = 0, error_gy = 0;
 
+// --- Rango Analógico Mecánico (Ajustar empíricamente) ---
+const int MIN_HALL = 1800;  // Valor ADC cuando la mano está abierta
+const int MAX_HALL = 2600;  // Valor ADC cuando la mano está cerrada
+
 unsigned long tiempoUltimaLectura = 0;
-const int INTERVALO_LECTURA = 10; // 100 Hz (transmisión fluida) — solo corre en estado ACTIVO
+const int INTERVALO_LECTURA = 10;  // 100 Hz (transmisión fluida) — solo corre en estado ACTIVO
 
-// --- ESTRUCTURA DE DATOS PARA ESP-NOW (definida en data_packet.h) ---
-GloveDataPacket_t datosGuante;
-esp_now_peer_info_t peerInfo;
 
-// --- Estado de bajo consumo ---
-enum EstadoGuante { GUANTE_IDLE, GUANTE_ACTIVO };
-volatile EstadoGuante estadoGuante = GUANTE_IDLE;
 
 // La firma de los callbacks de ESP-NOW cambió entre versiones del
 // core arduino-esp32 (PlatformIO usa una vieja tipo IDF4, Arduino IDE
@@ -102,17 +107,22 @@ void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
 // un GloveDataPacket_t, así que cualquier `len` distinto de
 // sizeof(CtrlMessage_t) se descarta.
 void OnCtrlRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
+  Serial.printf("\n>> INT. RX DISPARADA | Bytes recibidos: %d\n", len);
   if (len != sizeof(CtrlMessage_t)) {
+    Serial.println("-> ERROR: Tamaño de paquete incorrecto. Descartado.");
     return;
   }
   CtrlMessage_t msg;
   memcpy(&msg, incomingData, sizeof(msg));
+  Serial.printf("-> Comando recibido: 0x%02X\n", msg.cmd);
 
   if (msg.cmd == CTRL_CMD_WAKE) {
     estadoGuante = GUANTE_ACTIVO;
-    tiempoUltimaLectura = millis(); // evita un primer intervalo "atrasado"
+    tiempoUltimaLectura = millis();  // evita un primer intervalo "atrasado"
+    Serial.println("-> SISTEMA DESPIERTO. Iniciando biometría a 100 Hz...");
   } else if (msg.cmd == CTRL_CMD_SLEEP) {
     estadoGuante = GUANTE_IDLE;
+    Serial.println("-> SISTEMA DORMIDO. Ahorro de energía activado.");
   }
 }
 
@@ -122,17 +132,22 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 void OnCtrlRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+  Serial.printf("\n>> INT. RX DISPARADA | Bytes recibidos: %d\n", len);
   if (len != sizeof(CtrlMessage_t)) {
+    Serial.println("-> ERROR: Tamaño de paquete incorrecto. Descartado.");
     return;
   }
   CtrlMessage_t msg;
   memcpy(&msg, incomingData, sizeof(msg));
+  Serial.printf("-> Comando recibido: 0x%02X\n", msg.cmd);
 
   if (msg.cmd == CTRL_CMD_WAKE) {
     estadoGuante = GUANTE_ACTIVO;
     tiempoUltimaLectura = millis();
+    Serial.println("-> SISTEMA DESPIERTO. Iniciando biometría a 100 Hz...");
   } else if (msg.cmd == CTRL_CMD_SLEEP) {
     estadoGuante = GUANTE_IDLE;
+    Serial.println("-> SISTEMA DORMIDO. Ahorro de energía activado.");
   }
 }
 
@@ -140,7 +155,7 @@ void OnCtrlRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(8, 9); // Pines I2C ESP32-C3 (SDA=8, SCL=9)
+  Wire.begin(8, 9);  // Pines I2C ESP32-C3 (SDA=8, SCL=9)
 
   sensor.initialize();
   if (!sensor.testConnection()) {
@@ -153,14 +168,16 @@ void setup() {
   delay(1000);
   for (int i = 0; i < 200; i++) {
     sensor.getRotation(&gx, &gy, &gz);
-    error_gx += gx; error_gy += gy;
+    error_gx += gx;
+    error_gy += gy;
     delay(10);
   }
-  error_gx /= 200.0; error_gy /= 200.0;
+  error_gx /= 200.0;
+  error_gy /= 200.0;
   tiempo_prev = millis();
 
   // --- CONFIGURACIÓN WI-FI & ESP-NOW ---
-  WiFi.mode(WIFI_STA); // Modo Estación requerido para ESP-NOW
+  WiFi.mode(WIFI_STA);  // Modo Estación requerido para ESP-NOW
   esp_wifi_set_channel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error inicializando ESP-NOW");
@@ -203,7 +220,7 @@ void loop() {
     float accel_ang_x = atan(ay / sqrt(pow(ax, 2) + pow(az, 2))) * (180.0 / 3.14159);
     float accel_ang_y = atan(-ax / sqrt(pow(ay, 2) + pow(az, 2))) * (180.0 / 3.14159);
 
-    float girosc_tasa_x = (gx - error_gx) / 131.0; // 131 LSB/(°/s) @ ±250°/s (datasheet MPU-6050)
+    float girosc_tasa_x = (gx - error_gx) / 131.0;  // 131 LSB/(°/s) @ ±250°/s (datasheet MPU-6050)
     float girosc_tasa_y = (gy - error_gy) / 131.0;
 
     // Filtro complementario: 96% giróscopo (integración, deriva a
@@ -212,20 +229,34 @@ void loop() {
     angulo_x = 0.96 * (angulo_x + (girosc_tasa_x * (dt / 1000.0))) + 0.04 * accel_ang_x;
     angulo_y = 0.96 * (angulo_y + (girosc_tasa_y * (dt / 1000.0))) + 0.04 * accel_ang_y;
 
-    // 2. Procesar Sensores Hall
-    int lecturaIndice  = analogRead(pinHallIndice);
+    // 2. Procesar Sensores Hall (Digitalización Proporcional)
+    int lecturaIndice = analogRead(pinHallIndice);
     int lecturaCorazon = analogRead(pinHallCorazon);
 
-    // 3. Cargar el Struct
-    datosGuante.angulo_x     = angulo_x;
-    datosGuante.angulo_y     = angulo_y;
-    datosGuante.pinzaIndice  = (lecturaIndice  > UMBRAL_HALL);
-    datosGuante.pinzaCorazon = (lecturaCorazon > UMBRAL_HALL);
+    // Mapeo lineal de la ventana analógica a grados (0 a 180)
+    int anguloIndiceCalculado = map(lecturaIndice, MIN_HALL, MAX_HALL, 0, 180);
+    int anguloCorazonCalculado = map(lecturaCorazon, MIN_HALL, MAX_HALL, 0, 180);
+
+    // 3. Acondicionamiento Inercial (MPU6050)
+    // Suponiendo que el filtro arroja valores de -90 a 90 grados físicos, los centramos a 0-180
+    int ang_x_final = (int)(angulo_x + 90.0);
+    int ang_y_final = (int)(angulo_y + 90.0);
+
+    // 4. Cargar el Struct asegurando saturación de seguridad (0 a 180)
+    datosGuante.angulo_x = (uint8_t)constrain(ang_x_final, 0, 180);
+    datosGuante.angulo_y = (uint8_t)constrain(ang_y_final, 0, 180);
+    datosGuante.pinzaIndice = (uint8_t)constrain(anguloIndiceCalculado, 0, 180);
+    datosGuante.pinzaCorazon = (uint8_t)constrain(anguloCorazonCalculado, 0, 180);
+
+    // --- DEPURACIÓN ESTRUCTURADA ---
+    Serial.printf("Codo (X): %d° | Hombro (Y): %d° | Pinza: %d° | Muñeca: %d°\n",
+                  datosGuante.angulo_x, datosGuante.angulo_y,
+                  datosGuante.pinzaIndice, datosGuante.pinzaCorazon);
 
     // 4. TRANSMISIÓN INALÁMBRICA INMEDIATA
     esp_err_t resultado = esp_now_send(broadcastAddress,
-                                        (uint8_t *)&datosGuante, sizeof(datosGuante));
-    (void)resultado; // ver OnDataSent() para diagnóstico asíncrono real
+                                       (uint8_t *)&datosGuante, sizeof(datosGuante));
+    (void)resultado;  // ver OnDataSent() para diagnóstico asíncrono real
   }
 }
 

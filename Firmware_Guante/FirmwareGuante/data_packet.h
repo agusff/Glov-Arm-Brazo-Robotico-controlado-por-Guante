@@ -5,20 +5,20 @@
 #include <cmath>
 
 // ---------------------------------------------------------------
-// 1) Paquete ESP-NOW (guante -> receptor)
+// Paquete ESP-NOW (guante -> receptor)
 // ---------------------------------------------------------------
-// Ahora transmite exclusivamente ángulos listos para usar (0 a 180)
+
 typedef struct struct_mensaje {
-    uint8_t angulo_x;      // Codo (0-180°)
-    uint8_t angulo_y;      // Hombro (0-180°)
-    uint8_t pinzaIndice;   // Pinza (0-180°)
-    uint8_t pinzaCorazon;  // Muñeca (0-180°)
+    uint8_t angulo_x;      // Codo 
+    uint8_t angulo_y;      // Hombro 
+    uint8_t pinzaIndice;   // Pinza 
+    uint8_t pinzaCorazon;  // Muñeca
 } struct_mensaje;
 
 typedef struct_mensaje GloveDataPacket_t;
 
 // ---------------------------------------------------------------
-// 2) Trama UART (receptor -> Black Pill)
+// Trama UART (receptor -> Black Pill)
 // ---------------------------------------------------------------
 #define FRAME_START_BYTE   0xAA
 #define FRAME_END_BYTE     0x55
@@ -41,7 +41,7 @@ inline uint8_t computeFrameChecksum(uint8_t x_angle, uint8_t y_angle,
     return (uint8_t)(x_angle ^ y_angle ^ hall_1 ^ hall_2 ^ estado_espnow ^ 0xFF);
 }
 
-// El Gateway ya no calcula nada, solo traspasa los valores limpios
+
 inline void buildUartFrame(UartFrame_t &frame, const GloveDataPacket_t &data,
                             uint8_t estado_espnow) {
     frame.start        = FRAME_START_BYTE;
@@ -57,7 +57,7 @@ inline void buildUartFrame(UartFrame_t &frame, const GloveDataPacket_t &data,
 }
 
 // ---------------------------------------------------------------
-// 3) Canal de control de bajo consumo
+// Canal de control de bajo consumo
 // ---------------------------------------------------------------
 typedef struct __attribute__((packed)) {
     uint8_t cmd;

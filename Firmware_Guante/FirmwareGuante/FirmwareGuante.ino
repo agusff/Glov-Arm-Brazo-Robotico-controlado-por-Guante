@@ -1,45 +1,14 @@
 /*
  * Glov-Arm — Firmware del GUANTE (nodo transmisor ESP32-C3)
  * ---------------------------------------------------------------
- * Copia manual para Arduino IDE de glovarm_firmware/glovarm/src/main_glove.cpp
- * (proyecto fuente = PlatformIO). Si se edita acá, replicar el cambio
- * también en el .cpp de PlatformIO — no hay symlink entre ambos.
- *
- * *** ESTA ES LA VERSION QUE HAY QUE USAR PARA CARGAR DE VERDAD ***
- * PlatformIO compila este proyecto sin error, pero ESP-NOW no
- * funciona con la plataforma que trae (confirmado 2026-09-02, ver
- * comentario en platformio.ini). Cargar desde acá, con Arduino IDE
- * o arduino-cli y el core esp32 3.3.11 o mas nuevo.
  *
  * Configuración necesaria en Arduino IDE (Tools):
  *   - Board: "ESP32C3 Dev Module" (paquete esp32 by Espressif Systems, 3.3.11+)
  *   - USB CDC On Boot: "Enabled"  <- IMPRESCINDIBLE en placas Super Mini
  *     (USB nativo sin puente UART): sin esto, Serial.print() no sale
- *     por el puerto USB.
+ *     por el puerto USB. Solo hacer si se quiere depurar.
  *   - Librería: "MPU6050" de Electronic Cats (Sketch > Include Library >
  *     Manage Libraries), da I2Cdev.h y MPU6050.h.
- *
- * Callbacks de ESP-NOW: el código soporta tanto el core viejo (2.x)
- * como el nuevo (3.x) via #if ESP_ARDUINO_VERSION_MAJOR.
- *
- * Base: código recuperado del backup (Gemini). Struct de datos
- * centralizado en data_packet.h para no desincronizar con el
- * receptor (ESP-NOW copia el bloque de memoria tal cual).
- *
- * Modo de bajo consumo (confirmado con Agustín, audio 2026-08-19):
- * el guante arranca en IDLE — el hardware (I2C, MPU6050, calibración
- * de giróscopo) se inicializa igual que antes, pero el loop() NO lee
- * sensores ni transmite por ESP-NOW hasta recibir CTRL_CMD_WAKE del
- * receptor. Al recibir CTRL_CMD_SLEEP vuelve a IDLE. Esto evita el
- * consumo dominante (I2C a 100 Hz + radio TX a 100 Hz) mientras no
- * hay operador vinculado, sin necesidad de dormir el radio (que
- * complicaría bastante más la recepción de ESP-NOW — ver nota al
- * final del archivo).
- *
- * NOTA: esta versión no incluye botón de calibración ni LEDs de
- * estado (el Esquema Ordenador los menciona, pero no estaban en el
- * código recuperado). Si los tenían implementados, avisame y los
- * reincorporo.
  */
 
 #include <I2Cdev.h>
@@ -50,62 +19,61 @@
 #include <WiFi.h>
 #include "data_packet.h"
 
-MPU6050 sensor;
-
-// --- DIRECCIÓN MAC DEL RECEPTOR (ESP_brazo) ---
-uint8_t broadcastAddress[] = { 0x1C, 0xDB, 0xD4, 0xC6, 0x76, 0x38 };
+// Pines I2C ESP-C3
+#define SDA 8
+#define SLC 9
 
 // Canal WiFi fijo para ESP-NOW
 #define ESPNOW_WIFI_CHANNEL 1
 
 
-// --- Estado de bajo consumo ---
-enum EstadoGuante { GUANTE_IDLE,
-                    GUANTE_ACTIVO };
-volatile EstadoGuante estadoGuante = GUANTE_IDLE;
+// MAC DEL RECEPTOR (ESP_brazo) 
+uint8_t broadcastAddress[] = { 0x1C, 0xDB, 0xD4, 0xC6, 0x76, 0x38 };
 
-// --- ESTRUCTURA DE DATOS PARA ESP-NOW (definida en data_packet.h) ---
+// ESTRUCTURA DE DATOS PARA ESP-NOW
 GloveDataPacket_t datosGuante;
 esp_now_peer_info_t peerInfo;
 
 
-// --- Configuración Sensores Hall ---
+// Estados de la maquina
+enum EstadoGuante { GUANTE_IDLE,
+                    GUANTE_ACTIVO };
+volatile EstadoGuante estadoGuante = GUANTE_IDLE;
+
+
+// Sensores Hall 
 const int pinHallIndice = 0;   // ADC1_CH0
 const int pinHallCorazon = 1;  // ADC1_CH1
 const int UMBRAL_HALL = 3000;
+// Filtro EMA 
+float ema_indice = 0;
+float ema_corazon = 0;
+const float ALPHA_FLEX = 0.15;
+// Rango Analogo-Mecanico
+const int MIN_HALL = 1800;  // Valor ADC con maxima intensidad de campo mag.
+const int MAX_HALL = 2600;  // Valor ADC con minima intensidad de campo mag.
 
+// Giroscopio
 int16_t ax, ay, az, gx, gy, gz;
 unsigned long tiempo_prev;
 float dt;
 float angulo_x = 0, angulo_y = 0;
 float error_gx = 0, error_gy = 0;
 
-// --- Rango Analógico Mecánico (Ajustar empíricamente) ---
-const int MIN_HALL = 1800;  // Valor ADC cuando la mano está abierta
-const int MAX_HALL = 2600;  // Valor ADC cuando la mano está cerrada
+MPU6050 sensor;
+
 
 unsigned long tiempoUltimaLectura = 0;
 const int INTERVALO_LECTURA = 10;  // 100 Hz (transmisión fluida) — solo corre en estado ACTIVO
 
 
-
-// La firma de los callbacks de ESP-NOW cambió entre versiones del
-// core arduino-esp32 (PlatformIO usa una vieja tipo IDF4, Arduino IDE
-// va quedando en una nueva tipo IDF5 cada vez que se actualiza el
-// core). Se compila una firma u otra según la versión detectada, para
-// que el mismo .cpp/.ino sirva en ambos toolchains sin tocar nada.
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
 
-// Callback para verificar si el envío fue exitoso (depuración).
+// Depuracion
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
   // Se puede usar para chequear pérdidas de paquetes si fuese necesario.
 }
 
-// Callback de recepción: solo se usa para los mensajes de control
-// (CtrlMessage_t, 1 byte) que manda el receptor. Se distingue del
-// paquete de sensores por tamaño — el guante nunca debería recibir
-// un GloveDataPacket_t, así que cualquier `len` distinto de
-// sizeof(CtrlMessage_t) se descarta.
 void OnCtrlRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
   Serial.printf("\n>> INT. RX DISPARADA | Bytes recibidos: %d\n", len);
   if (len != sizeof(CtrlMessage_t)) {
@@ -118,8 +86,8 @@ void OnCtrlRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
 
   if (msg.cmd == CTRL_CMD_WAKE) {
     estadoGuante = GUANTE_ACTIVO;
-    tiempoUltimaLectura = millis();  // evita un primer intervalo "atrasado"
-    Serial.println("-> SISTEMA DESPIERTO. Iniciando biometría a 100 Hz...");
+    tiempoUltimaLectura = millis(); 
+    Serial.println("-> SISTEMA DESPIERTO. Iniciando biometría...");
   } else if (msg.cmd == CTRL_CMD_SLEEP) {
     estadoGuante = GUANTE_IDLE;
     Serial.println("-> SISTEMA DORMIDO. Ahorro de energía activado.");
@@ -144,7 +112,7 @@ void OnCtrlRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
   if (msg.cmd == CTRL_CMD_WAKE) {
     estadoGuante = GUANTE_ACTIVO;
     tiempoUltimaLectura = millis();
-    Serial.println("-> SISTEMA DESPIERTO. Iniciando biometría a 100 Hz...");
+    Serial.println("-> SISTEMA DESPIERTO. Iniciando biometría...");
   } else if (msg.cmd == CTRL_CMD_SLEEP) {
     estadoGuante = GUANTE_IDLE;
     Serial.println("-> SISTEMA DORMIDO. Ahorro de energía activado.");
@@ -155,16 +123,15 @@ void OnCtrlRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(8, 9);  // Pines I2C ESP32-C3 (SDA=8, SCL=9)
+  Wire.begin(SDA, SCL);
 
+  //Incializacion del giroscopio
   sensor.initialize();
   if (!sensor.testConnection()) {
     Serial.println("Error al iniciar MPU6050.");
   }
 
   // --- Calibración giroscopio (offset estático, sensor en reposo) ---
-  // Se hace una sola vez al arrancar, independientemente del estado
-  // IDLE/ACTIVO, porque requiere que la mano esté quieta.
   delay(1000);
   for (int i = 0; i < 200; i++) {
     sensor.getRotation(&gx, &gy, &gz);
@@ -199,9 +166,7 @@ void setup() {
 }
 
 void loop() {
-  // En IDLE no se lee ni transmite nada: es la parte que ahorra
-  // batería (sin esto, el I2C al MPU6050 y el TX por ESP-NOW corren
-  // a 100 Hz todo el tiempo, vinculado o no).
+
   if (estadoGuante != GUANTE_ACTIVO) {
     return;
   }
@@ -212,7 +177,7 @@ void loop() {
   if (tiempoActual - tiempoUltimaLectura >= INTERVALO_LECTURA) {
     tiempoUltimaLectura = tiempoActual;
 
-    // 1. Procesar MPU6050
+    // Procesamiento del MPU6050
     sensor.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
     dt = tiempoActual - tiempo_prev;
     tiempo_prev = tiempoActual;
@@ -229,48 +194,38 @@ void loop() {
     angulo_x = 0.96 * (angulo_x + (girosc_tasa_x * (dt / 1000.0))) + 0.04 * accel_ang_x;
     angulo_y = 0.96 * (angulo_y + (girosc_tasa_y * (dt / 1000.0))) + 0.04 * accel_ang_y;
 
-    // 2. Procesar Sensores Hall (Digitalización Proporcional)
-    int lecturaIndice = analogRead(pinHallIndice);
+    // Procesamiento Sensores Hall 
+    int lecturaIndice  = analogRead(pinHallIndice);
     int lecturaCorazon = analogRead(pinHallCorazon);
 
-    // Mapeo lineal de la ventana analógica a grados (0 a 180)
-    int anguloIndiceCalculado = map(lecturaIndice, MIN_HALL, MAX_HALL, 0, 180);
-    int anguloCorazonCalculado = map(lecturaCorazon, MIN_HALL, MAX_HALL, 0, 180);
+    // Filtro EMA
+    ema_indice = (ALPHA_FLEX * lecturaIndice) + ((1.0 - ALPHA_FLEX) * ema_indice);
+    ema_corazon = (ALPHA_FLEX * lecturaCorazon) + ((1.0 - ALPHA_FLEX) * ema_corazon);
 
-    // 3. Acondicionamiento Inercial (MPU6050)
+    // Mapeo lineal ADC - Grados
+    int anguloIndiceCalculado = map((int)ema_indice, MIN_HALL, MAX_HALL, 0, 180);
+    int anguloCorazonCalculado = map((int)ema_corazon, MIN_HALL, MAX_HALL, 0, 180);
+
+    // Acondicionamiento Inercial (MPU6050)
     // Suponiendo que el filtro arroja valores de -90 a 90 grados físicos, los centramos a 0-180
-    int ang_x_final = (int)(angulo_x + 90.0);
+    int ang_x_final = (int)(-angulo_x + 90.0); // El signo menos es por la posicion fisica del mpu, se debe ajustar dependiendo la posicion
     int ang_y_final = (int)(angulo_y + 90.0);
 
-    // 4. Cargar el Struct asegurando saturación de seguridad (0 a 180)
+    // Carga del Struct asegurando saturación de seguridad (0 a 180)
     datosGuante.angulo_x = (uint8_t)constrain(ang_x_final, 0, 180);
     datosGuante.angulo_y = (uint8_t)constrain(ang_y_final, 0, 180);
     datosGuante.pinzaIndice = (uint8_t)constrain(anguloIndiceCalculado, 0, 180);
     datosGuante.pinzaCorazon = (uint8_t)constrain(anguloCorazonCalculado, 0, 180);
 
-    // --- DEPURACIÓN ESTRUCTURADA ---
+    // Depuracion
     Serial.printf("Codo (X): %d° | Hombro (Y): %d° | Pinza: %d° | Muñeca: %d°\n",
                   datosGuante.angulo_x, datosGuante.angulo_y,
                   datosGuante.pinzaIndice, datosGuante.pinzaCorazon);
 
-    // 4. TRANSMISIÓN INALÁMBRICA INMEDIATA
+    // Transmision inalambrica
     esp_err_t resultado = esp_now_send(broadcastAddress,
                                        (uint8_t *)&datosGuante, sizeof(datosGuante));
     (void)resultado;  // ver OnDataSent() para diagnóstico asíncrono real
   }
 }
 
-/*
- * Nota sobre ahorro de energía adicional (no implementado):
- * -----------------------------------------------------------------
- * Lo de arriba ya elimina la actividad de I2C y de radio TX mientras
- * está IDLE, que es el consumo dominante. Ir más allá — apagar el
- * radio WiFi/PHY (light sleep / modem sleep de verdad) y seguir
- * pudiendo "despertar" al recibir un paquete ESP-NOW — es bastante
- * más delicado: hay que configurar esp_wifi_set_ps() y coordinar el
- * wake source con cuidado para no perder el primer paquete de wake,
- * y con el framework Arduino el soporte es menos directo que en
- * ESP-IDF puro. Dado el tiempo que queda hasta la entrega (30/8), lo
- * dejé afuera; si quieren perseguirlo, mejor probarlo aparte y no
- * sobre el firmware que van a entregar.
- */

@@ -19,9 +19,29 @@
 #include <WiFi.h>
 #include "data_packet.h"
 
-// Pines I2C ESP-C3
-#define SDA 8
-#define SLC 9
+// Pines I2C ESP-C3 (SCL en GPIO 10 y SDA en GPIO 20 para evitar strapping pins y liberar el LED)
+#define SDA 20
+#define SCL 10
+
+// LED Integrado y Botón de Calibración
+#define LED_BUILTIN_PIN 8
+#define BTN_CALIBRAR 2
+
+// Variables para Interrupción de Calibración
+volatile bool flagCalibracion = false;
+volatile unsigned long ultimoRebote = 0;
+float offset_x = 90.0; // Valores por defecto (se sobreescriben al calibrar)
+float offset_y = 90.0;
+unsigned long ledBlinkStart = 0;
+bool isBlinking = false;
+
+void IRAM_ATTR ISR_BotonCero() {
+    unsigned long t = millis();
+    if(t - ultimoRebote > 250) { // 250 ms antirrebote
+        flagCalibracion = true;
+        ultimoRebote = t;
+    }
+}
 
 // Canal WiFi fijo para ESP-NOW
 #define ESPNOW_WIFI_CHANNEL 1
@@ -55,7 +75,7 @@ const int MAX_HALL = 2600;  // Valor ADC con minima intensidad de campo mag.
 
 // Giroscopio
 int16_t ax, ay, az, gx, gy, gz;
-unsigned long tiempo_prev;
+unsigned long tiempo_prev_micros;
 float dt;
 float angulo_x = 0, angulo_y = 0;
 float error_gx = 0, error_gy = 0;
@@ -125,6 +145,12 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(SDA, SCL);
 
+  pinMode(LED_BUILTIN_PIN, OUTPUT);
+  digitalWrite(LED_BUILTIN_PIN, HIGH); // Apagado por defecto (Active Low)
+  
+  pinMode(BTN_CALIBRAR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_CALIBRAR), ISR_BotonCero, FALLING);
+
   //Incializacion del giroscopio
   sensor.initialize();
   if (!sensor.testConnection()) {
@@ -141,10 +167,11 @@ void setup() {
   }
   error_gx /= 200.0;
   error_gy /= 200.0;
-  tiempo_prev = millis();
+  tiempo_prev_micros = micros();
 
   // --- CONFIGURACIÓN WI-FI & ESP-NOW ---
   WiFi.mode(WIFI_STA);  // Modo Estación requerido para ESP-NOW
+  esp_wifi_set_max_tx_power(40); // 40 * 0.25 = 10 dBm
   esp_wifi_set_channel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error inicializando ESP-NOW");
@@ -167,7 +194,14 @@ void setup() {
 
 void loop() {
 
+  // Feedback visual del LED no bloqueante
+  if(isBlinking && (millis() - ledBlinkStart > 100)) {
+      digitalWrite(LED_BUILTIN_PIN, HIGH); // Apaga LED
+      isBlinking = false;
+  }
+
   if (estadoGuante != GUANTE_ACTIVO) {
+    vTaskDelay(pdMS_TO_TICKS(100)); // Ahorro de energía en reposo
     return;
   }
 
@@ -179,11 +213,12 @@ void loop() {
 
     // Procesamiento del MPU6050
     sensor.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-    dt = tiempoActual - tiempo_prev;
-    tiempo_prev = tiempoActual;
+    unsigned long tiempoActualMicros = micros();
+    dt = (tiempoActualMicros - tiempo_prev_micros) / 1000000.0;
+    tiempo_prev_micros = tiempoActualMicros;
 
-    float accel_ang_x = atan(ay / sqrt(pow(ax, 2) + pow(az, 2))) * (180.0 / 3.14159);
-    float accel_ang_y = atan(-ax / sqrt(pow(ay, 2) + pow(az, 2))) * (180.0 / 3.14159);
+    float accel_ang_x = atan(-ay / sqrt(pow(ax, 2) + pow(az, 2))) * (180.0 / 3.14159);
+    float accel_ang_y = atan(ax / sqrt(pow(ay, 2) + pow(az, 2))) * (180.0 / 3.14159);
 
     float girosc_tasa_x = (gx - error_gx) / 131.0;  // 131 LSB/(°/s) @ ±250°/s (datasheet MPU-6050)
     float girosc_tasa_y = (gy - error_gy) / 131.0;
@@ -191,12 +226,33 @@ void loop() {
     // Filtro complementario: 96% giróscopo (integración, deriva a
     // largo plazo) + 4% acelerómetro (referencia absoluta, ruido
     // vibratorio a corto plazo).
-    angulo_x = 0.96 * (angulo_x + (girosc_tasa_x * (dt / 1000.0))) + 0.04 * accel_ang_x;
-    angulo_y = 0.96 * (angulo_y + (girosc_tasa_y * (dt / 1000.0))) + 0.04 * accel_ang_y;
+    angulo_x = 0.96 * (angulo_x + (girosc_tasa_x * dt)) + 0.04 * accel_ang_x;
+    angulo_y = 0.96 * (angulo_y + (girosc_tasa_y * dt)) + 0.04 * accel_ang_y;
 
-    // Procesamiento Sensores Hall 
-    int lecturaIndice  = analogRead(pinHallIndice);
-    int lecturaCorazon = analogRead(pinHallCorazon);
+    // Lógica de Puesta a Cero (Calibración Dinámica 90°)
+    if (flagCalibracion) {
+        // Buscamos que ang_x_final y ang_y_final sean exactamente 90
+        offset_x = 90.0 + angulo_x;
+        offset_y = 90.0 - angulo_y;
+        
+        flagCalibracion = false;
+        isBlinking = true;
+        ledBlinkStart = millis();
+        digitalWrite(LED_BUILTIN_PIN, LOW); // Enciende LED
+    }
+
+    // Acondicionamiento Inercial dinámico
+    int ang_x_final = (int)(-angulo_x + offset_x);
+    int ang_y_final = (int)(angulo_y + offset_y);
+
+    // Procesamiento Sensores Hall (Sobremuestreo de 4 lecturas)
+    int sumIndice = 0, sumCorazon = 0;
+    for(int i=0; i<4; i++){
+        sumIndice += analogRead(pinHallIndice);
+        sumCorazon += analogRead(pinHallCorazon);
+    }
+    int lecturaIndice  = sumIndice / 4;
+    int lecturaCorazon = sumCorazon / 4;
 
     // Filtro EMA
     ema_indice = (ALPHA_FLEX * lecturaIndice) + ((1.0 - ALPHA_FLEX) * ema_indice);
@@ -205,11 +261,6 @@ void loop() {
     // Mapeo lineal ADC - Grados
     int anguloIndiceCalculado = map((int)ema_indice, MIN_HALL, MAX_HALL, 0, 180);
     int anguloCorazonCalculado = map((int)ema_corazon, MIN_HALL, MAX_HALL, 0, 180);
-
-    // Acondicionamiento Inercial (MPU6050)
-    // Suponiendo que el filtro arroja valores de -90 a 90 grados físicos, los centramos a 0-180
-    int ang_x_final = (int)(-angulo_x + 90.0); // El signo menos es por la posicion fisica del mpu, se debe ajustar dependiendo la posicion
-    int ang_y_final = (int)(angulo_y + 90.0);
 
     // Carga del Struct asegurando saturación de seguridad (0 a 180)
     datosGuante.angulo_x = (uint8_t)constrain(ang_x_final, 0, 180);

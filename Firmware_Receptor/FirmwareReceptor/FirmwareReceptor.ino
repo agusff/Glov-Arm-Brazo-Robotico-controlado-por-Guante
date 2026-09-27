@@ -25,6 +25,11 @@
 // Período de reenvío de la trama hacia la STM32.
 #define FRAME_PERIOD_MS     20
 
+#define LED_BUILTIN_PIN 8
+
+static unsigned long ledBlinkStart = 0;
+static uint8_t blinkStep = 0;
+
 // MAC del ESP32 del guante
 uint8_t gloveAddress[] = {0x1C, 0xDB, 0xD4, 0xC6, 0x76, 0x30};
 static esp_now_peer_info_t glovePeerInfo;
@@ -86,10 +91,14 @@ void setup() {
   // Puerto de Depuración (USB hacia la PC)
   Serial.begin(115200);
 
+  pinMode(LED_BUILTIN_PIN, OUTPUT);
+  digitalWrite(LED_BUILTIN_PIN, HIGH); // Apagado por defecto (Active Low)
+
   // Puerto de Hardware (UART real hacia la STM32 por pines físicos)
   Serial0.begin(115200);
 
   WiFi.mode(WIFI_STA);
+  esp_wifi_set_max_tx_power(40); // 40 * 0.25 = 10 dBm
   esp_wifi_set_channel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error inicializando ESP-NOW en el Receptor");
@@ -130,6 +139,9 @@ void loop() {
           if (pending_cmd == UART_CMD_VINCULAR) {
             Serial.println("==== COMANDO ACEPTADO: VINCULAR (Despertando Guante) ====");
             sendCtrlToGlove(CTRL_CMD_WAKE);
+            blinkStep = 1;
+            ledBlinkStart = millis();
+            digitalWrite(LED_BUILTIN_PIN, LOW); // Encender primer parpadeo
           } else if (pending_cmd == UART_CMD_DESVINCULAR) {
             Serial.println("==== COMANDO ACEPTADO: DESVINCULAR (Durmiendo Guante) ====");
             sendCtrlToGlove(CTRL_CMD_SLEEP);
@@ -149,4 +161,21 @@ void loop() {
     lastFrameSent = now;
     sendFrameToStm32();
   }
+
+  // --- Lógica del doble parpadeo ---
+  if (blinkStep > 0) {
+    if (now - ledBlinkStart >= 100) {
+      ledBlinkStart = now;
+      blinkStep++;
+      if (blinkStep == 2) {
+        digitalWrite(LED_BUILTIN_PIN, HIGH); // Apagar
+      } else if (blinkStep == 3) {
+        digitalWrite(LED_BUILTIN_PIN, LOW);  // Encender segundo parpadeo
+      } else if (blinkStep == 4) {
+        digitalWrite(LED_BUILTIN_PIN, HIGH); // Apagar y terminar
+        blinkStep = 0;
+      }
+    }
+  }
 }
+

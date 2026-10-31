@@ -31,8 +31,7 @@ El código procesa la información matemáticamente en el *Edge* antes de transm
   * Elimina el ruido vibratorio y la deriva (*drift*) natural del sensor inercial.
   * Fusiona matemáticamente un **96% de la integración del giroscopio** con un **4% de la referencia del acelerómetro**, obteniendo ángulos absolutos estables.
 * **Digitalización Estricta de Flexión**
-  * Las lecturas analógicas de los sensores Hall se filtran mediante un comparador por umbral (`UMBRAL_HALL = 3000`).
-  * Si la señal supera el límite, se traduce en un estado booleano cerrado, evitando vacilaciones dinámicas en las transiciones de la pinza.
+  * Las lecturas analógicas de los sensores Hall se filtran un filtro de media exponencia (EMA).
 
 ---
 
